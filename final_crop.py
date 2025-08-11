@@ -21,26 +21,43 @@ import json
 # Script Information
 # ----------------------------------------
 print("=" * 80)
-print("🤖 NANOWELL DETECTION AND CROPPING TOOL")
+print("?? NANOWELL DETECTION AND CROPPING TOOL")
 print("=" * 80)
-print("📝 Created by: Saikiran")
-print("🔧 Version: 1.0")
-print("📅 Date: 2024")
-print("🎯 Purpose: Automated nanowell detection and cropping using YOLO")
+print("?? Created by: Saikiran")
+print("?? Version: 1.0")
+print("?? Date: 2025")
+print("?? Purpose: Automated nanowell detection and cropping using YOLO")
 print("=" * 80)
 
 # ----------------------------------------
 # Logging setup (file + console)
 # ----------------------------------------
-log_filename = f'cropping_debug_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log'
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler(log_filename),
-        logging.StreamHandler(sys.stdout)
-    ]
-)
+# Global variable to store the log filename
+log_filename = None
+
+def setup_logging(output_dir: Path):
+    """Setup logging with a single log file in the results/logs directory"""
+    global log_filename
+    
+    # Create logs directory under the output directory
+    logs_dir = output_dir / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Create a single log file for this run
+    log_filename = logs_dir / f'nanowell_cropping_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log'
+    
+    # Configure logging to write to both file and console
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler(log_filename),
+            logging.StreamHandler(sys.stdout)
+        ]
+    )
+    
+    print_and_log(f"Log file created: {log_filename}")
+    return log_filename
 
 def print_and_log(msg: str, level: str = 'info'):
     print(msg)
@@ -92,7 +109,7 @@ def get_bucket_dirs(bucket: str, base_out_dir: Path) -> tuple:
     debug_dir = base_out_dir / bucket / "debug"
     return images_8bit, images_16bit, crops_vis, debug_dir
 
-CROP_SIZE        = (196, 196)
+CROP_SIZE        = (281, 281)
 CONF_THRESH      = 0.1  # Lowered from 0.25 to catch more potential wells
 OVERLAP_THRESH   = 0.6  # Increased from 0.4 to allow slightly more overlap
 CHANNELS         = [1, 2, 3, 4]  # Original channel numbers
@@ -217,8 +234,8 @@ def filter_overlapping_boxes(boxes: np.ndarray, confidences: np.ndarray = None, 
     keep = [i for i in range(len(boxes)) if i not in to_remove]
     
     # Filter out Invalid class if classes are provided
-    if classes is not None:
-        keep = [i for i in keep if classes[i] != INVALID_CLASS]
+    #if classes is not None:
+    #    keep = [i for i in keep if classes[i] != INVALID_CLASS]
     
     return keep
 
@@ -583,283 +600,289 @@ def ensure_temporal_consistency(scene_id: int, time_id: int, boxes: np.ndarray, 
     return boxes, classes
 
 def save_crops_bucketed(result: Dict, images: Dict[int, np.ndarray], input_root: Path, base_out_dir: Path, pattern: re.Pattern):
-    scene_id = result['metadata']['scene_id']
-    time_id = result['metadata']['time_id']
-    boxes = result['boxes']
-    classes = result['classes']
-    confidences = result.get('confidences', [])  # Get confidence scores if available
+    scene_id    = result['metadata']['scene_id']
+    time_id     = result['metadata']['time_id']
+    boxes       = result['boxes']
+    classes     = result['classes']
+    confidences = result.get('confidences', [])
 
-    # Apply temporal consistency check
+    # 1) Temporal consistency
     print_and_log(f"\nProcessing {get_bucket_name(scene_id)}, t{time_id:02d}:")
-    print_and_log(f"Initial well count: {len(boxes)} ({sum(classes != INVALID_CLASS)} valid)")
     boxes, classes = ensure_temporal_consistency(scene_id, time_id, boxes, classes)
-    print_and_log(f"After temporal validation: {len(boxes)} wells ({sum(classes != INVALID_CLASS)} valid)")
 
-    # Get bucket name and directories
-    bucket = get_bucket_name(scene_id)
-    images_8bit, images_16bit, crops_vis, debug_dir = get_bucket_dirs(bucket, base_out_dir)
+    bucket       = get_bucket_name(scene_id)
+    dir_8bit, dir_16bit, dir_vis, debug_dir = get_bucket_dirs(bucket, base_out_dir)
+    # ensure base dirs
+    for d in (dir_8bit.parent, dir_16bit.parent, dir_vis, debug_dir):
+        d.mkdir(parents=True, exist_ok=True)
 
-    # Create base directories
-    images_8bit.mkdir(parents=True, exist_ok=True)
-    images_16bit.mkdir(parents=True, exist_ok=True)
-    crops_vis.mkdir(parents=True, exist_ok=True)
-    debug_dir.mkdir(parents=True, exist_ok=True)
+    # --- VALIDITY CHECK BASED ON HEIGHT AND WIDTH ---
+    for idx, box in enumerate(boxes):
+        x1, y1, x2, y2 = map(int, box)
+        height = y2 - y1
+        width = x2 - x1
+        cls = classes[idx]
+        if cls == 1:  # Diamond
+            if height > 205 and width > 205:  # Both height and width must be > 205 for Diamond
+                classes[idx] = 1  # Valid Diamond
+            else:
+                classes[idx] = 4  # Invalid
+        elif cls == 0:  # Square
+            if height > 160 and width > 160:  # Both height and width must be > 160 for Square
+                classes[idx] = 0  # Valid Square
+            else:
+                classes[idx] = 4  # Invalid
+        # else: leave as is
 
+    # 2) Debug image (exactly as before)
     if SAVE_DEBUG_IMAGE and images.get(1) is not None:
-        # Create debug image with enhanced visualization
-        dbg = cv2.merge([cv2.normalize(images[1], None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)] * 3)
-        
-        # Draw grid lines to help identify missing wells
+        dbg = cv2.merge([
+            cv2.normalize(images[1], None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+        ] * 3)
         h, w = dbg.shape[:2]
-        grid_color = (128, 128, 128)  # Gray color for grid
-        
-        # Draw horizontal and vertical grid lines
-        for i in range(6):  # Assuming 6x6 grid
-            x = int(w * (i + 1) / 7)
-            y = int(h * (i + 1) / 7)
-            cv2.line(dbg, (x, 0), (x, h), grid_color, 1)
-            cv2.line(dbg, (0, y), (w, y), grid_color, 1)
-        
-        # Draw all detections with detailed information
-        for idx, ((x1,y1,x2,y2), cls) in enumerate(zip(boxes, classes), 1):
-            # Calculate size and center
+        for i in range(6):
+            x = int(w*(i+1)/7); y = int(h*(i+1)/7)
+            cv2.line(dbg, (x,0), (x,h), (128,128,128), 1)
+            cv2.line(dbg, (0,y), (w,y), (128,128,128), 1)
+
+        # cluster for numbering
+        centers = np.array([[(b[0]+b[2])/2, (b[1]+b[3])/2] for b in boxes])
+        n_grid  = int(np.sqrt(EXPECTED_WELLS))
+        kx = KMeans(n_clusters=n_grid, random_state=0).fit(centers[:,0].reshape(-1,1))
+        ky = KMeans(n_clusters=n_grid, random_state=0).fit(centers[:,1].reshape(-1,1))
+        xs = np.sort(kx.cluster_centers_.flatten())
+        ys = np.sort(ky.cluster_centers_.flatten())
+        grid_pos = []
+        for idx, (cx, cy) in enumerate(centers):
+            col = np.argmin(np.abs(xs-cx))
+            row = np.argmin(np.abs(ys-cy))
+            grid_pos.append((row, col, idx))
+        sorted_pos = sorted(grid_pos, key=lambda x:(x[1],x[0]))
+        well_numbers = {idx: i+1 for i, (_,_,idx) in enumerate(sorted_pos)}
+
+        class_colors = {
+            0:(0,255,0), 1:(255,0,0), 2:(0,0,255),
+            3:(255,255,0), 4:(128,128,128)
+        }
+
+        for idx, box in enumerate(boxes):
+            x1, y1, x2, y2 = map(int, box)
+            cls = classes[idx]
+            num = well_numbers.get(idx, idx+1)
+            row = ((num-1)//6)+1
+            col = ((num-1)%6)+1
+            seq_lbl  = f"#{num:02d}"
+            grid_lbl = f"R{col}C{row}"
+            color    = class_colors.get(cls, (255,255,255))
+
+            cv2.rectangle(dbg, (x1,y1),(x2,y2), color, 3)
+            cv2.putText(dbg, seq_lbl,  (x1+5,y1+25),
+                        cv2.FONT_HERSHEY_SIMPLEX,1.2,(0,0,0),3)
+            cv2.putText(dbg, seq_lbl,  (x1+5,y1+25),
+                        cv2.FONT_HERSHEY_SIMPLEX,1.2,color,2)
+            cv2.putText(dbg, grid_lbl, (x1+5,y1+55),
+                        cv2.FONT_HERSHEY_SIMPLEX,1.0,(0,0,0),3)
+            cv2.putText(dbg, grid_lbl, (x1+5,y1+55),
+                        cv2.FONT_HERSHEY_SIMPLEX,1.0,color,2)
+            cx, cy = (x1+x2)//2, (y1+y2)//2
+            cv2.circle(dbg, (cx,cy), 4, color, -1)
+            cv2.circle(dbg, (cx,cy), 4, (255,255,255), 1)
+
+            # --- Overlay width and height ---
             width = x2 - x1
             height = y2 - y1
-            center_x = (x1 + x2) / 2
-            center_y = (y1 + y2) / 2
-            
-            if cls == INVALID_CLASS:
-                color = (0, 0, 255)  # Red for invalid
-                # Draw size info for invalid wells to debug size filtering
-                cv2.putText(dbg, f"{width:.0f}x{height:.0f}", (int(x1), int(y1)-25), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
-            else:
-                color = (0, 255, 0)  # Green for valid
-            
-            # Draw detection box
-            cv2.rectangle(dbg, (int(x1),int(y1)), (int(x2),int(y2)), color, 2)
-            
-            # Draw well number and class
-            label = f"{idx}:{ID_TO_LABEL.get(cls, 'Unknown')}"
-            cv2.putText(dbg, label, (int(x1), int(y1)-5), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
-            
-            # Draw center point
-            cv2.circle(dbg, (int(center_x), int(center_y)), 2, color, -1)
-            
-            # Add validation indicator
-            if cls != INVALID_CLASS:
-                was_invalid = any(
-                    np.array_equal(box, [x1,y1,x2,y2]) and c == INVALID_CLASS 
-                    for t, (boxes_t, classes_t) in temporal_cache.get(scene_id, {}).items() 
-                    if t == time_id
-                    for box, c in zip(boxes_t, classes_t)
-                )
-                if was_invalid:
-                    cv2.putText(dbg, "✓", (int(x2)-20, int(y2)-5),
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,0), 2)
-        
-        # Add summary statistics
-        valid_count = sum(1 for c in classes if c != INVALID_CLASS)
-        total_count = len(boxes)
-        stats_text = [
-            f"Valid wells: {valid_count}/{total_count}",
-            f"Missing: {36-valid_count} (expected 36)",
-            f"Scene {scene_id}, Time {time_id}"
+            # Width: center of top edge
+            width_text = f"W:{width}"
+            width_font = cv2.FONT_HERSHEY_SIMPLEX
+            width_font_scale = 0.8
+            width_thickness = 2
+            width_size = cv2.getTextSize(width_text, width_font, width_font_scale, width_thickness)[0]
+            width_x = x1 + (width // 2) - (width_size[0] // 2)
+            width_y = y1 - 10 if y1 - 10 > 0 else y1 + width_size[1] + 10
+            # Draw background and border
+            padding = 4
+            wx1 = width_x - padding
+            wy1 = width_y - width_size[1] - padding
+            wx2 = width_x + width_size[0] + padding
+            wy2 = width_y + padding
+            cv2.rectangle(dbg, (wx1, wy1), (wx2, wy2), (0, 0, 0), -1)
+            cv2.rectangle(dbg, (wx1, wy1), (wx2, wy2), (255, 255, 255), 2)
+            cv2.putText(dbg, width_text, (width_x, width_y), width_font, width_font_scale, (0, 255, 255), width_thickness)
+
+            # Height: center of left edge
+            height_text = f"H:{height}"
+            height_font = cv2.FONT_HERSHEY_SIMPLEX
+            height_font_scale = 0.8
+            height_thickness = 2
+            height_size = cv2.getTextSize(height_text, height_font, height_font_scale, height_thickness)[0]
+            height_x = x1 - height_size[0] - 10 if x1 - height_size[0] - 10 > 0 else x1 + 10
+            height_y = y1 + (height // 2) + (height_size[1] // 2)
+            hx1 = height_x - padding
+            hy1 = height_y - height_size[1] - padding
+            hx2 = height_x + height_size[0] + padding
+            hy2 = height_y + padding
+            cv2.rectangle(dbg, (hx1, hy1), (hx2, hy2), (0, 0, 0), -1)
+            cv2.rectangle(dbg, (hx1, hy1), (hx2, hy2), (255, 255, 255), 2)
+            cv2.putText(dbg, height_text, (height_x, height_y), height_font, height_font_scale, (0, 255, 255), height_thickness)
+
+            # --- End overlay width and height ---
+
+        valid_cnt = sum(1 for c in classes if c!=INVALID_CLASS)
+        stats = [
+            f"Valid wells: {valid_cnt}/{len(boxes)}",
+            f"Scene {scene_id}, Time {time_id}",
+            f"Expected {EXPECTED_WELLS}"
         ]
-        y_offset = 30
-        for text in stats_text:
-            cv2.putText(dbg, text, (10, y_offset),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2)
-            y_offset += 25
-        
+        y0 = 40
+        for txt in stats:
+            cv2.putText(dbg, txt, (10,y0),
+                        cv2.FONT_HERSHEY_SIMPLEX,0.9,(255,255,255),3)
+            cv2.putText(dbg, txt, (10,y0),
+                        cv2.FONT_HERSHEY_SIMPLEX,0.9,(0,0,0),1)
+            y0 += 30
+
         dbg_path = debug_dir / f"{bucket}_t{time_id:02d}_debug.jpg"
         cv2.imwrite(str(dbg_path), dbg)
         print_and_log(f"Saved enhanced debug image: {dbg_path}")
 
-    # Filter and collect valid detections
-    valid_detections = []
-    valid_confidences = []  # Store confidence scores for valid detections
-    current_positions = set()
-    for i, (box, cls) in enumerate(zip(boxes, classes)):
-        x1, y1, x2, y2 = box
-        width = x2 - x1
-        height = y2 - y1
-        
-        # Log well details
-        print_and_log(f"Checking well {i+1}:")
-        print_and_log(f"  Size: {width:.1f}x{height:.1f}")
-        print_and_log(f"  Class: {ID_TO_LABEL.get(cls, 'Unknown')}")
-        
-        # More lenient size check with both min and max
-        if width < MIN_SIZE or height < MIN_SIZE:
-            print_and_log(f"  SKIPPED: Too small (min size: {MIN_SIZE})")
-            continue
-        elif width > MAX_SIZE or height > MAX_SIZE:
-            print_and_log(f"  SKIPPED: Too large (max size: {MAX_SIZE})")
-            continue
-        elif cls == INVALID_CLASS:
-            print_and_log(f"  SKIPPED: Invalid class")
-            continue
-            
-        center_x = (x1 + x2) / 2
-        center_y = (y1 + y2) / 2
-        pos_key = get_well_key(center_x, center_y)
-        
-        # Check if this position is already taken (with logging)
-        if pos_key in current_positions:
-            print_and_log(f"  SKIPPED: Position already taken at {pos_key}")
-            continue
-            
-        current_positions.add(pos_key)
-        valid_detections.append((i, box, center_x, center_y))
-        # Store confidence score for this valid detection
-        if i < len(confidences):
-            valid_confidences.append(confidences[i])
-        else:
-            valid_confidences.append(0.8)  # Default confidence if not available
-        print_and_log(f"  VALID: Added to valid detections")
+    # 3) Grid-based sort & selection
+    centers = np.array([[(b[0]+b[2])/2, (b[1]+b[3])/2] for b in boxes])
+    n_grid  = int(np.sqrt(EXPECTED_WELLS))
+    kx = KMeans(n_clusters=n_grid, random_state=0).fit(centers[:,0].reshape(-1,1))
+    ky = KMeans(n_clusters=n_grid, random_state=0).fit(centers[:,1].reshape(-1,1))
+    xs = np.sort(kx.cluster_centers_.flatten())
+    ys = np.sort(ky.cluster_centers_.flatten())
 
-    # First timepoint for this scene - establish reference positions
-    if scene_id not in scene_well_positions:
-        if time_id == 1:  # First timepoint
-            scene_well_positions[scene_id] = current_positions
-            print_and_log(f"Established reference positions for scene {scene_id} with {len(current_positions)} wells")
-        else:
-            print_and_log(f"Warning: First detection for scene {scene_id} is not t01", 'warning')
+    grid_positions = []
+    for idx, (cx, cy) in enumerate(centers):
+        col = np.argmin(np.abs(xs - cx))
+        row = np.argmin(np.abs(ys - cy))
+        grid_positions.append((row, col, idx))
+    sorted_positions = sorted(grid_positions, key=lambda x:(x[1],x[0]))
+    all_sorted   = [(idx, boxes[idx]) for (_,_,idx) in sorted_positions]
+    valid_sorted = [(idx,box)       for idx,box in all_sorted if classes[idx]!=INVALID_CLASS]
+
+    if len(valid_sorted) == EXPECTED_WELLS:
+        to_crop = valid_sorted
+        print_and_log(f"Found exactly {EXPECTED_WELLS} valid wells → cropping only those.")
     else:
-        # Check for missing wells from reference positions
-        reference_positions = scene_well_positions[scene_id]
-        missing_positions = reference_positions - current_positions
-        new_positions = current_positions - reference_positions
-        
-        if missing_positions:
-            print_and_log(f"Warning: Missing {len(missing_positions)} wells in {bucket}, t{time_id:02d} compared to reference (t01)", 'warning')
-            for pos in missing_positions:
-                print_and_log(f"  Missing well at position {pos}", 'info')
-        
-        if new_positions:
-            print_and_log(f"Warning: Found {len(new_positions)} new wells in {bucket}, t{time_id:02d} not in reference (t01)", 'warning')
-            for pos in new_positions:
-                print_and_log(f"  New well at position {pos}", 'info')
+        to_crop = all_sorted
+        print_and_log(f"Valid wells ({len(valid_sorted)}) ≠ {EXPECTED_WELLS} → including invalid wells, total {len(to_crop)}.")
 
-    # First, organize detections into a grid
-    if valid_detections:
-        # Get all x and y coordinates
-        x_coords = [d[2] for d in valid_detections]
-        y_coords = [d[3] for d in valid_detections]
-        
-        # Find unique x and y coordinates with some tolerance for alignment issues
-        tolerance = 20  # pixels
-        unique_x = []
-        unique_y = []
-        
-        # Helper function to find if a coordinate is close to any existing one
-        def is_close(coord, coord_list, tol):
-            return any(abs(c - coord) < tol for c in coord_list)
-        
-        # Collect unique x coordinates
-        for x in x_coords:
-            if not unique_x or not is_close(x, unique_x, tolerance):
-                unique_x.append(x)
-        
-        # Collect unique y coordinates
-        for y in y_coords:
-            if not unique_y or not is_close(y, unique_y, tolerance):
-                unique_y.append(y)
-        
-        # Sort coordinates
-        unique_x.sort()
-        unique_y.sort()
-        
-        # Assign grid positions to each detection
-        grid_positions = []
-        for _, box, center_x, center_y in valid_detections:
-            # Find column (closest x coordinate)
-            col = min(range(len(unique_x)), key=lambda i: abs(unique_x[i] - center_x))
-            # Find row (closest y coordinate)
-            row = min(range(len(unique_y)), key=lambda i: abs(unique_y[i] - center_y))
-            grid_positions.append((row, col, box))
-        
-        # Sort by column first (for 1,4,7 pattern), then by row
-        sorted_positions = sorted(grid_positions, key=lambda x: (x[1], x[0]))
-        sorted_detections = [(i, box) for i, (_, _, box) in enumerate(sorted_positions)]
-    else:
-        sorted_detections = []
-
-    total_valid = len(sorted_detections)
-    
-    # Warn about unexpected well counts but don't enforce a limit
-    if total_valid < MIN_WELLS:
-        print_and_log(f"Warning: Found only {total_valid} valid wells in {bucket}, t{time_id:02d}. Expected at least {MIN_WELLS}.", 'warning')
-    elif total_valid > MAX_WELLS:
-        print_and_log(f"Warning: Found {total_valid} valid wells in {bucket}, t{time_id:02d}. Expected no more than {MAX_WELLS}.", 'warning')
-    elif total_valid != EXPECTED_WELLS:
-        print_and_log(f"Note: Found {total_valid} valid wells in {bucket}, t{time_id:02d}. Usually expect {EXPECTED_WELLS}.", 'info')
-
-    print_and_log(f"Processing {len(sorted_detections)} valid detections for {bucket}, t{time_id:02d}")
-
-    # Generate meta files for the first timepoint (t01) to establish the grid
+    # 4) Meta-file generation for t01
     if time_id == 1:
-        print_and_log(f"Generating meta files for scene {scene_id}")
-        sorted_nanowells = generate_meta_files(scene_id, valid_detections, base_out_dir, time_id, valid_confidences)
+        meta_dir = base_out_dir / bucket / "meta"
+        meta_dir.mkdir(parents=True, exist_ok=True)
+
+        # prepare valid_detections list
+        valid_for_meta = []
+        valid_conf     = []
+        for idx, box in valid_sorted:
+            cx = (box[0]+box[2])/2
+            cy = (box[1]+box[3])/2
+            valid_for_meta.append((idx, box, cx, cy))
+            valid_conf.append(confidences[idx] if idx < len(confidences) else None)
+
+        sorted_nanowells = generate_meta_files(scene_id, valid_for_meta, base_out_dir, time_id, valid_conf)
         if sorted_nanowells:
-            print_and_log(f"Successfully generated meta files with {len(sorted_nanowells)} sorted nanowells")
-            # Create selected_nanowells.txt file for downstream pipeline
             create_selected_nanowells_file(scene_id, sorted_nanowells, base_out_dir)
+
+    # 5) Crop → per-well subfolders
+    for well_num, (idx, (x1, y1, x2, y2)) in enumerate(to_crop, start=1):
+        cls = classes[idx]
+        height = y2 - y1
+        width = x2 - x1
+        if (cls == 1 and height > 205 and width > 205) or (cls == 0 and height > 160 and width > 160):
+            for ch in CHANNELS:
+                I = images.get(ch)
+                if I is None:
+                    print_and_log(f"  [WARN] missing channel {ch} for well #{well_num}", 'warning')
+                    continue
+
+                x1i, y1i, x2i, y2i = map(int, (x1, y1, x2, y2))
+                
+                # Calculate padding to reach exactly 281x281
+                original_width = x2i - x1i
+                original_height = y2i - y1i
+                target_size = 281
+                
+                # Calculate padding needed for each dimension to reach exactly 281x281
+                width_padding_left = (target_size - original_width) // 2
+                width_padding_right = target_size - original_width - width_padding_left
+                height_padding_top = (target_size - original_height) // 2
+                height_padding_bottom = target_size - original_height - height_padding_top
+                
+                # Add padding to expand the crop area
+                x1_padded = max(0, x1i - width_padding_left)
+                y1_padded = max(0, y1i - height_padding_top)
+                x2_padded = min(I.shape[1], x2i + width_padding_right)  # I.shape[1] is image width
+                y2_padded = min(I.shape[0], y2i + height_padding_bottom)  # I.shape[0] is image height
+                
+                crop = I[y1_padded:y2_padded, x1_padded:x2_padded]
+                if crop.size == 0:
+                    print_and_log(f"  [WARN] zero-size crop at well #{well_num}", 'warning')
+                    continue
+
+                fname = f"imgNo{well_num}{CHANNEL_MAP[ch]}_t{time_id}.tif"
+
+                # 16-bit - save without resizing
+                w16 = dir_16bit / f"imgNo{well_num}{CHANNEL_MAP[ch]}"
+                w16.mkdir(parents=True, exist_ok=True)
+                out16 = w16 / fname
+                cv2.imwrite(str(out16), crop, [cv2.IMWRITE_TIFF_COMPRESSION, 1])
+                print_and_log(f"Saved 16-bit crop: {out16}")
+
+                # 8-bit - normalize and save without resizing
+                w8 = dir_8bit / f"imgNo{well_num}{CHANNEL_MAP[ch]}"
+                w8.mkdir(parents=True, exist_ok=True)
+                norm8 = cv2.normalize(crop, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+                out8 = w8 / fname
+                cv2.imwrite(str(out8), norm8, [cv2.IMWRITE_TIFF_COMPRESSION, 1])
+                print_and_log(f"Saved 8-bit crop: {out8}")
+
+                # vis - save without resizing
+                wv = dir_vis / f"imgNo{well_num}{CHANNEL_MAP[ch]}"
+                wv.mkdir(parents=True, exist_ok=True)
+                outv = wv / fname
+                cv2.imwrite(str(outv), crop, [cv2.IMWRITE_TIFF_COMPRESSION, 1])
+                print_and_log(f"Saved vis crop: {outv}")
         else:
-            print_and_log(f"Warning: No meta files generated for scene {scene_id}", 'warning')
-
-    # Create directories only for valid detections
-    channel_dirs_16 = {}
-    channel_dirs_8 = {}
-    
-    for well_num, (idx, (x1,y1,x2,y2)) in enumerate(sorted_detections, 1):
-        # Create directories for this valid well
-        channel_dirs_16[well_num] = {}
-        channel_dirs_8[well_num] = {}
-        for ch in CHANNELS:
-            well_dir_16 = images_16bit / f"imgNo{well_num}{CHANNEL_MAP[ch]}"
-            well_dir_8 = images_8bit / f"imgNo{well_num}{CHANNEL_MAP[ch]}"
-            well_dir_16.mkdir(parents=True, exist_ok=True)
-            well_dir_8.mkdir(parents=True, exist_ok=True)
-            channel_dirs_16[well_num][ch] = well_dir_16
-            channel_dirs_8[well_num][ch] = well_dir_8
-            
-        # Process crops for this well
-        for ch in CHANNELS:
-            img = images.get(ch)
-            if img is None: continue
-            
-            # Convert coordinates to integers
-            x1, y1, x2, y2 = map(int, [x1, y1, x2, y2])
-            crop = img[y1:y2, x1:x2]
-            if crop.size == 0: continue
-
-            # New file naming format with proper well numbering
-            base_name = f"imgNo{well_num}{CHANNEL_MAP[ch]}_t{time_id}.tif"
-
-            # 16-bit output - save as uncompressed TIFF
-            resized16 = cv2.resize(crop, CROP_SIZE, interpolation=cv2.INTER_AREA)
-            out16 = channel_dirs_16[well_num][ch] / base_name
-            # Use cv2.IMWRITE_TIFF_COMPRESSION=1 for uncompressed TIFF
-            cv2.imwrite(str(out16), resized16, [cv2.IMWRITE_TIFF_COMPRESSION, 1])
-            print_and_log(f"Saved 16-bit crop: {out16}")
-
-            # 8-bit output - save as uncompressed TIFF
-            norm8 = cv2.normalize(crop, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-            resized8 = cv2.resize(norm8, CROP_SIZE, interpolation=cv2.INTER_AREA)
-            out8 = channel_dirs_8[well_num][ch] / base_name
-            # Use cv2.IMWRITE_TIFF_COMPRESSION=1 for uncompressed TIFF
-            cv2.imwrite(str(out8), resized8, [cv2.IMWRITE_TIFF_COMPRESSION, 1])
-            print_and_log(f"Saved 8-bit crop: {out8}")
-
-            # Save crops_vis (visualization) - same as 16-bit but in crops_vis directory
-            crops_vis_dir = crops_vis / f"imgNo{well_num}{CHANNEL_MAP[ch]}"
-            crops_vis_dir.mkdir(parents=True, exist_ok=True)
-            out_vis = crops_vis_dir / base_name
-            cv2.imwrite(str(out_vis), resized16, [cv2.IMWRITE_TIFF_COMPRESSION, 1])
-            print_and_log(f"Saved crops_vis: {out_vis}")
+            print_and_log(f"Skipping crop for well #{well_num} (class={cls}, height={height}) - does not meet validity threshold.", 'info')
+            # Save invalid nanowell crops in Invalid_nanowells folder
+            for ch in CHANNELS:
+                I = images.get(ch)
+                if I is None:
+                    print_and_log(f"  [WARN] missing channel {ch} for INVALID well #{well_num}", 'warning')
+                    continue
+                x1i, y1i, x2i, y2i = map(int, (x1, y1, x2, y2))
+                
+                # Calculate padding to reach exactly 281x281
+                original_width = x2i - x1i
+                original_height = y2i - y1i
+                target_size = 281
+                
+                # Calculate padding needed for each dimension to reach exactly 281x281
+                width_padding_left = (target_size - original_width) // 2
+                width_padding_right = target_size - original_width - width_padding_left
+                height_padding_top = (target_size - original_height) // 2
+                height_padding_bottom = target_size - original_height - height_padding_top
+                
+                # Add padding to expand the crop area
+                x1_padded = max(0, x1i - width_padding_left)
+                y1_padded = max(0, y1i - height_padding_top)
+                x2_padded = min(I.shape[1], x2i + width_padding_right)  # I.shape[1] is image width
+                y2_padded = min(I.shape[0], y2i + height_padding_bottom)  # I.shape[0] is image height
+                
+                crop = I[y1_padded:y2_padded, x1_padded:x2_padded]
+                if crop.size == 0:
+                    print_and_log(f"  [WARN] zero-size crop at INVALID well #{well_num}", 'warning')
+                    continue
+                fname = f"imgNo{well_num}{CHANNEL_MAP[ch]}_t{time_id}.tif"
+                invalid_dir = dir_16bit.parent / "Invalid_nanowells" / f"imgNo{well_num}{CHANNEL_MAP[ch]}"
+                invalid_dir.mkdir(parents=True, exist_ok=True)
+                out_invalid = invalid_dir / fname
+                cv2.imwrite(str(out_invalid), crop, [cv2.IMWRITE_TIFF_COMPRESSION, 1])
+                print_and_log(f"Saved INVALID nanowell crop: {out_invalid}")
 
 def process_gpu_chunk(gpu_id: int, files: List[Path], input_root: Path, base_out_dir: Path, pattern: re.Pattern) -> List[str]:
     print_and_log(f"[GPU{gpu_id}] Processing {len(files)} file(s)")
@@ -949,11 +972,11 @@ def NANOWELL_CROP_IMAGES(RAW_INPUT_PATH, OUTPUT_PATH):
         bool: True if processing completed successfully, False otherwise
     """
     print("\n" + "=" * 60)
-    print("🚀 STARTING NANOWELL CROPPING PROCESS")
+    print("?? STARTING NANOWELL CROPPING PROCESS")
     print("=" * 60)
-    print(f"📁 Input Directory: {RAW_INPUT_PATH}")
-    print(f"📂 Output Directory: {OUTPUT_PATH}")
-    print(f"⏰ Start Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"?? Input Directory: {RAW_INPUT_PATH}")
+    print(f"?? Output Directory: {OUTPUT_PATH}")
+    print(f"?? Start Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print("=" * 60)
     
     try:
@@ -961,19 +984,22 @@ def NANOWELL_CROP_IMAGES(RAW_INPUT_PATH, OUTPUT_PATH):
         input_root = Path(RAW_INPUT_PATH)
         base_out_dir = Path(OUTPUT_PATH)
         
+        # Setup logging in the results directory
+        setup_logging(base_out_dir)
+        
         # Validate input directory exists
         if not input_root.exists():
-            print_and_log(f"❌ Error: Input directory does not exist: {input_root}", 'error')
+            print_and_log(f"?? Error: Input directory does not exist: {input_root}", 'error')
             return False
         
-        print(f"✅ Input directory validated successfully")
+        print(f"?? Input directory validated successfully")
         
         # Generate pattern from input folder name
         pattern = generate_pattern_from_folder(input_root)
         
-        print(f"🔍 Generated file pattern: {pattern.pattern}")
-        print(f"🤖 YOLO Model Path: {MODEL_PATH}")
-        print(f"🖥️  Available GPUs: {NUM_GPUS}")
+        print(f"?? Generated file pattern: {pattern.pattern}")
+        print(f"?? YOLO Model Path: {MODEL_PATH}")
+        print(f"????  Available GPUs: {NUM_GPUS}")
         
         print_and_log(f"Input root: {input_root}")
         print_and_log(f"Base output directory: {base_out_dir}")
@@ -982,26 +1008,26 @@ def NANOWELL_CROP_IMAGES(RAW_INPUT_PATH, OUTPUT_PATH):
         print_and_log(f"Starting with {NUM_GPUS} GPU(s)")
         # Base directory will be created as needed for each bucket
         base_out_dir.mkdir(parents=True, exist_ok=True)
-        print(f"📂 Created output directory structure")
+        print(f"?? Created output directory structure")
         
         run_parallel_on_gpus(input_root, base_out_dir, pattern)
         
         print("\n" + "=" * 60)
-        print("🎉 NANOWELL CROPPING COMPLETED SUCCESSFULLY!")
+        print("?? NANOWELL CROPPING COMPLETED SUCCESSFULLY!")
         print("=" * 60)
-        print(f"⏰ End Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        print(f"📂 Results saved to: {base_out_dir}")
-        print(f"📋 Log file: {log_filename}")
+        print(f"?? End Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"?? Results saved to: {base_out_dir}")
+        print(f"?? Log file: {log_filename}")
         print("=" * 60)
         print("All done.")
         return True
         
     except Exception as e:
         print("\n" + "=" * 60)
-        print("❌ NANOWELL CROPPING FAILED!")
+        print("?? NANOWELL CROPPING FAILED!")
         print("=" * 60)
-        print(f"⏰ Error Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        print(f"🚨 Error: {e}")
+        print(f"?? Error Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"?? Error: {e}")
         print("=" * 60)
         print_and_log(f"Error in NANOWELL_CROP_IMAGES: {e}", 'error')
         return False
@@ -1074,13 +1100,13 @@ def NANOWELL_CROP_IMAGES_WITH_RANGE(RAW_INPUT_PATH, OUTPUT_PATH, BLOCKS, FRAMES)
     target_scenes = sorted(list(set(target_scenes)))
     
     print("\n" + "=" * 60)
-    print("🚀 STARTING NANOWELL CROPPING PROCESS WITH RANGE")
+    print("?? STARTING NANOWELL CROPPING PROCESS WITH RANGE")
     print("=" * 60)
-    print(f"📁 Input Directory: {RAW_INPUT_PATH}")
-    print(f"📂 Output Directory: {OUTPUT_PATH}")
-    print(f"📦 Target Scenes: {[f's{scene:03d}' for scene in target_scenes]}")
-    print(f"🎬 Frames (Time): 1 to {FRAMES} (t01 to t{FRAMES:02d})")
-    print(f"⏰ Start Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"?? Input Directory: {RAW_INPUT_PATH}")
+    print(f"?? Output Directory: {OUTPUT_PATH}")
+    print(f"?? Target Scenes: {[f's{scene:03d}' for scene in target_scenes]}")
+    print(f"?? Frames (Time): 1 to {FRAMES} (t01 to t{FRAMES:02d})")
+    print(f"?? Start Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print("=" * 60)
     
     try:
@@ -1088,19 +1114,22 @@ def NANOWELL_CROP_IMAGES_WITH_RANGE(RAW_INPUT_PATH, OUTPUT_PATH, BLOCKS, FRAMES)
         input_root = Path(RAW_INPUT_PATH)
         base_out_dir = Path(OUTPUT_PATH)
         
+        # Setup logging in the results directory
+        setup_logging(base_out_dir)
+        
         # Validate input directory exists
         if not input_root.exists():
-            print_and_log(f"❌ Error: Input directory does not exist: {input_root}", 'error')
+            print_and_log(f"?? Error: Input directory does not exist: {input_root}", 'error')
             return False
         
-        print(f"✅ Input directory validated successfully")
+        print(f"?? Input directory validated successfully")
         
         # Generate pattern from input folder name
         pattern = generate_pattern_from_folder(input_root)
         
-        print(f"🔍 Generated file pattern: {pattern.pattern}")
-        print(f"🤖 YOLO Model Path: {MODEL_PATH}")
-        print(f"🖥️  Available GPUs: {NUM_GPUS}")
+        print(f"?? Generated file pattern: {pattern.pattern}")
+        print(f"?? YOLO Model Path: {MODEL_PATH}")
+        print(f"????  Available GPUs: {NUM_GPUS}")
         
         print_and_log(f"Input root: {input_root}")
         print_and_log(f"Base output directory: {base_out_dir}")
@@ -1109,27 +1138,27 @@ def NANOWELL_CROP_IMAGES_WITH_RANGE(RAW_INPUT_PATH, OUTPUT_PATH, BLOCKS, FRAMES)
         print_and_log(f"Starting with {NUM_GPUS} GPU(s)")
         # Base directory will be created as needed for each bucket
         base_out_dir.mkdir(parents=True, exist_ok=True)
-        print(f"📂 Created output directory structure")
+        print(f"?? Created output directory structure")
         
         # Call the modified run function with specific target scenes
         run_parallel_on_gpus_with_specific_scenes(input_root, base_out_dir, pattern, target_scenes, FRAMES)
         
         print("\n" + "=" * 60)
-        print("🎉 NANOWELL CROPPING COMPLETED SUCCESSFULLY!")
+        print("?? NANOWELL CROPPING COMPLETED SUCCESSFULLY!")
         print("=" * 60)
-        print(f"⏰ End Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        print(f"📂 Results saved to: {base_out_dir}")
-        print(f"📋 Log file: {log_filename}")
+        print(f"?? End Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"?? Results saved to: {base_out_dir}")
+        print(f"?? Log file: {log_filename}")
         print("=" * 60)
         print("All done.")
         return True
         
     except Exception as e:
         print("\n" + "=" * 60)
-        print("❌ NANOWELL CROPPING FAILED!")
+        print("?? NANOWELL CROPPING FAILED!")
         print("=" * 60)
-        print(f"⏰ Error Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        print(f"🚨 Error: {e}")
+        print(f"?? Error Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"?? Error: {e}")
         print("=" * 60)
         print_and_log(f"Error in NANOWELL_CROP_IMAGES_WITH_RANGE: {e}", 'error')
         return False
@@ -1189,10 +1218,10 @@ def run_parallel_on_gpus_with_specific_scenes(input_root: Path, base_out_dir: Pa
 
 def main():
     print("\n" + "=" * 60)
-    print("🔧 RUNNING NANOWELL CROPPING TOOL (COMMAND LINE MODE)")
+    print("?? RUNNING NANOWELL CROPPING TOOL (COMMAND LINE MODE)")
     print("=" * 60)
-    print("📝 Created by: Saikiran")
-    print("🎯 Automated nanowell detection and cropping")
+    print("?? Created by: Saikiran")
+    print("?? Automated nanowell detection and cropping")
     print("=" * 60)
     
     parser = argparse.ArgumentParser(description='Nanowell detection and cropping tool')
@@ -1218,15 +1247,15 @@ def main():
     global CHANNEL_MAP
     if args.channel_mapping:
         CHANNEL_MAP = parse_channel_mapping(args.channel_mapping)
-        print(f"🔗 Channel Mapping: {CHANNEL_MAP}")
+        print(f"?? Channel Mapping: {CHANNEL_MAP}")
     else:
-        print(f"🔗 Using Default Channel Mapping: {CHANNEL_MAP}")
+        print(f"?? Using Default Channel Mapping: {CHANNEL_MAP}")
     
-    print(f"📁 Input Directory: {args.input_root}")
-    print(f"📂 Output Directory: {args.base_out_dir}")
+    print(f"?? Input Directory: {args.input_root}")
+    print(f"?? Output Directory: {args.base_out_dir}")
     if args.blocks and args.frames:
-        print(f"📦 Blocks: {args.blocks}")
-        print(f"🎬 Frames (Time): 1 to {args.frames} (t01 to t{args.frames:02d})")
+        print(f"?? Blocks: {args.blocks}")
+        print(f"?? Frames (Time): 1 to {args.frames} (t01 to t{args.frames:02d})")
     print("=" * 60)
     
     # Use the appropriate function based on whether blocks and frames are provided
@@ -1244,9 +1273,9 @@ def main():
         success = NANOWELL_CROP_IMAGES(args.input_root, args.base_out_dir)
     
     if success:
-        print_and_log("✅ Processing completed successfully!")
+        print_and_log("?? Processing completed successfully!")
     else:
-        print_and_log("❌ Processing failed!", 'error')
+        print_and_log("?? Processing failed!", 'error')
         sys.exit(1)
 
 if __name__ == "__main__":
